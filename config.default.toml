@@ -95,6 +95,31 @@ scorers = [
     { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "minimize"},
 ]
 
+# Internal modification module: "abliteration" (original method) or "som".
+# SOM requires: uv sync --extra som
+modifier = "abliteration"
+
+# SOM scope: "auto" searches global and per-layer methods, or fix one with
+# "global" / "per layer". Auto and per-layer train a SOM at every transformer layer.
+som_direction_scope = "auto"
+
+# SOM grid side length, maximum directions, and training settings.
+som_grid_size = 4
+# Optional rectangular grid [x, y], overriding som_grid_size.
+# som_grid_shape = [3, 5]
+som_directions = 4
+som_iterations = 10000
+som_learning_rate = 0.01
+som_sigma = 0.5
+
+# Optional zero-based global source layer. Unset: search middle-to-late source layers.
+# Source layers are discrete; SOM neurons are never interpolated between layers.
+# With auto, fixes only the global choice; cannot be used with "per layer".
+# som_source_layer = 15
+
+# Upper bound for total strength, shared across directions (not per direction).
+som_max_weight = 4.0
+
 # Whether to adjust the residual directions so that only the component that is
 # orthogonal to the good direction is subtracted during abliteration.
 orthogonalize_direction = true

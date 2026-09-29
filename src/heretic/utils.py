@@ -262,6 +262,26 @@ def batchify(items: list[T], batch_size: int) -> list[list[T]]:
 
 
 def get_trial_parameters(trial: Trial | FrozenTrial) -> dict[str, str]:
+    if "modifier_parameters" in trial.user_attrs:
+        result = {"modifier": trial.user_attrs["modifier"]}
+
+        def flatten(prefix: str, value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    flatten(f"{prefix}.{key}" if prefix else key, child)
+            elif isinstance(value, list):
+                result[prefix] = ", ".join(
+                    f"{item:.3f}" if isinstance(item, float) else str(item)
+                    for item in value
+                )
+            else:
+                result[prefix] = (
+                    f"{value:.2f}" if isinstance(value, float) else str(value)
+                )
+
+        flatten("", trial.user_attrs["modifier_parameters"])
+        return result
+
     params = {}
 
     direction_index = trial.user_attrs["direction_index"]
@@ -568,8 +588,9 @@ def generate_reproduce_json(
     version_info = get_heretic_version_info()
 
     data = {
-        # Version 3: plugin-based schema with generic scores/baseline scores.
-        "version": "3",
+        # Version 4 adds this fork's internal modifier name and parameter payload.
+        # Preserve the version-3 schema for unconverted legacy trials.
+        "version": "4" if "modifier_parameters" in trial.user_attrs else "3",
         "timestamp": timestamp,
         "system": None,  # Defined here to preserve insertion order.
         "environment": {
@@ -583,6 +604,11 @@ def generate_reproduce_json(
         },
         "settings": settings.model_dump(),
         "parameters": {
+            "modifier": trial.user_attrs["modifier"],
+            "parameters": trial.user_attrs["modifier_parameters"],
+        }
+        if "modifier_parameters" in trial.user_attrs
+        else {
             "direction_index": trial.user_attrs["direction_index"],
             "abliteration_parameters": trial.user_attrs["parameters"],
         },

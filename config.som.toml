@@ -1,0 +1,23 @@
+# Copy to config.toml, then run: uv run --extra som heretic --model MODEL_ID
+modifier = "som"
+som_direction_scope = "auto" # Or fix "global" / "per layer".
+som_grid_size = 4
+# som_grid_shape = [3, 5] # Optional rectangular grid, overriding som_grid_size.
+som_directions = 4
+som_iterations = 10000
+som_learning_rate = 0.01
+som_sigma = 0.5
+som_max_weight = 4.0
+
+# Keep the existing magnitude-preserving behavior. SOM uses a rank of at least
+# som_directions; raising this setting improves the FULL approximation at a cost.
+orthogonalize_direction = true
+row_normalization = "full"
+full_normalization_lora_rank = 8
+
+# To reduce startup work, set scope to "global" and fix a known source layer.
+# In "auto", a fixed source affects only global trials; all layers are still trained.
+# som_source_layer = 15
+
+# Standard and SOM studies use separate checkpoint files automatically.
+n_trials = 200

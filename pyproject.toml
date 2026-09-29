@@ -41,10 +41,13 @@ dependencies = [
     "torch",  # version deliberately unspecified
     "torchvision",  # version deliberately unspecified
     "tqdm~=4.67",
-    "transformers[kernels]~=5.6",
+    "transformers[kernels]>=5.6",
 ]
 
 [project.optional-dependencies]
+som = [
+    "minisom~=2.3.5",
+]
 research = [
     "geom-median~=0.1",
     "imageio~=2.37",

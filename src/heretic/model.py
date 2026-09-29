@@ -32,6 +32,7 @@ from transformers.generation import (
 )
 
 from .config import QuantizationMethod, RowNormalization, Settings
+from .directional import additive_factors
 from .system import empty_cache
 from .utils import Prompt, batchify, format_exception, print
 
@@ -218,6 +219,8 @@ class Model:
             # Row magnitude preservation introduces nonlinear effects.
             lora_rank = self.settings.full_normalization_lora_rank
 
+        lora_rank = getattr(self, "lora_rank", lora_rank)
+        self.lora_rank = lora_rank
         self.peft_config = LoraConfig(
             r=lora_rank,
             target_modules=target_modules,
@@ -237,6 +240,21 @@ class Model:
         print(
             f"* LoRA adapters initialized (target types: {', '.join(display_targets)})"
         )
+
+    def apply_lora(self, rank: int) -> None:
+        """Configure the adapter rank during modifier initialization.
+
+        Removes existing adapters without merging them. The chosen rank survives
+        reset_model(), including a full reload after export.
+        """
+        if rank < 1:
+            raise ValueError("LoRA rank must be positive")
+        if isinstance(self.model, PeftModel):
+            if self.peft_config.r == rank:
+                return
+            self.model = self.model.unload()
+        self.lora_rank = rank
+        self._apply_lora()
 
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
@@ -617,6 +635,78 @@ class Model:
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
+
+    def abliterate_multiple(
+        self,
+        directions: Tensor | dict[int, Tensor],
+        direction_weights: Tensor | dict[int, Tensor],
+        parameters: dict[str, AbliterationParameters],
+    ) -> None:
+        """Apply global or per-layer direction banks through existing LoRA targets.
+
+        Each component retains its usual layer-strength envelope. The mixture
+        weights sum to one, so adding directions does not multiply total strength.
+        For per-layer banks, keys are zero-based transformer layer indices;
+        omitted layers remain untouched. Call reset_model before each trial.
+        """
+        layer_count = len(self.get_layers())
+        banks: dict[int, tuple[Tensor, Tensor]]
+        if isinstance(directions, Tensor) and isinstance(direction_weights, Tensor):
+            banks = {i: (directions, direction_weights) for i in range(layer_count)}
+        elif isinstance(directions, dict) and isinstance(direction_weights, dict):
+            direction_banks = cast(dict[int, Tensor], directions)
+            weight_banks = cast(dict[int, Tensor], direction_weights)
+            if direction_banks.keys() != weight_banks.keys() or any(
+                i < 0 or i >= layer_count for i in direction_banks
+            ):
+                raise ValueError(
+                    "Direction and weight banks must have matching valid layers"
+                )
+            banks = {i: (bank, weight_banks[i]) for i, bank in direction_banks.items()}
+        else:
+            raise ValueError(
+                "Directions and weights must both be tensors or per-layer banks"
+            )
+        for layer_index, (layer_directions, layer_weights) in sorted(banks.items()):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                params = parameters[component]
+                distance = abs(layer_index - params.max_weight_position)
+                if distance > params.min_weight_distance:
+                    continue
+                fraction = (
+                    distance / params.min_weight_distance
+                    if params.min_weight_distance
+                    else 0.0
+                )
+                strength = params.max_weight + fraction * (
+                    params.min_weight - params.max_weight
+                )
+                if strength == 0:
+                    continue
+                for module in modules:
+                    module = cast(Linear, module)
+                    base_weight = cast(Tensor, module.base_layer.weight)
+                    quant_state = getattr(base_weight, "quant_state", None)
+                    if quant_state is None:
+                        W = base_weight.float()
+                    else:
+                        W = bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+                            base_weight.data, quant_state
+                        ).float()
+                    W = W.view(W.shape[0], -1)
+                    B, A = additive_factors(
+                        W,
+                        layer_directions,
+                        strength * layer_weights,
+                        self.settings.row_normalization,
+                        self.peft_config.r,
+                        self.settings.seed,
+                    )
+                    weight_A = cast(Tensor, module.lora_A["default"].weight)
+                    weight_B = cast(Tensor, module.lora_B["default"].weight)
+                    with torch.no_grad():
+                        weight_A.copy_(A.to(weight_A))
+                        weight_B.copy_(B.to(weight_B))
 
     def generate(
         self,

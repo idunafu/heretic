@@ -127,6 +127,16 @@ save the model, upload it to Hugging Face, chat with it to test how well it work
 run standard benchmarks on it, or any combination of those actions.
 
 
+This fork also supports a SOM module based on multi-directional refusal suppression.
+Run `uv run --extra som heretic --model MODEL_ID --modifier som` to use it, or keep
+`modifier = "abliteration"` for the original method. SOM searches both global and
+per-layer directions by default; use `--som-direction-scope "per layer"` or
+`--som-direction-scope global` to fix the scope. See [config.som.toml](config.som.toml)
+and the [SOM module guide (日本語)](docs/som-module.ja.md) for settings, behavior, and
+the internal module API. This implementation uses weighted additive updates inspired
+by [PR #196](https://github.com/p-e-w/heretic/pull/196); it is not an exact reproduction
+of the paper's sequential ablation.
+
 ## Research features
 
 In addition to its primary function of removing model censorship, Heretic also

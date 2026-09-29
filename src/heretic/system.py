@@ -426,7 +426,8 @@ def get_requirements_dict() -> dict[str, str]:
     # We start with heretic-llm and the core compute libraries.
     # PyTorch is not listed as a dependency in the heretic-llm package
     # because installation is hardware-specific and must be done manually.
-    packages_to_check = ["heretic-llm", "torch", "torchaudio", "torchvision"]
+    # MiniSom is optional, but must be recorded when installed for SOM runs.
+    packages_to_check = ["heretic-llm", "torch", "torchaudio", "torchvision", "minisom"]
 
     visited = set()
     required_packages = set()

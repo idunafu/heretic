@@ -2,7 +2,7 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 from enum import Enum
-from typing import Dict, Literal
+from typing import Any, Dict, Literal
 
 from pydantic import (
     BaseModel,
@@ -10,6 +10,7 @@ from pydantic import (
     NonNegativeInt,
     PositiveInt,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import (
     BaseSettings,
@@ -359,6 +360,85 @@ class Settings(BaseSettings):
             " <optimization> is one of 'minimize', 'maximize', 'none' (do not optimize)."
         ),
     )
+
+    modifier: Literal["abliteration", "som"] = Field(
+        default="abliteration",
+        description="Model modification module: abliteration (original method) or som.",
+    )
+
+    som_direction_scope: Literal["auto", "global", "per layer"] = Field(
+        default="auto",
+        description=(
+            "SOM direction scope: global uses one source layer, per layer uses each "
+            "layer's own directions, auto lets Optuna choose between both."
+        ),
+    )
+    som_grid_size: PositiveInt = Field(
+        default=4, description="Side length of the hexagonal SOM grid."
+    )
+    som_grid_shape: tuple[PositiveInt, PositiveInt] | None = Field(
+        default=None,
+        description="Optional rectangular SOM dimensions [x, y], overriding som_grid_size.",
+    )
+    som_directions: PositiveInt = Field(
+        default=4, description="Maximum number of SOM directions used per source layer."
+    )
+    som_iterations: PositiveInt = Field(
+        default=10000, description="Number of SOM training updates per source layer."
+    )
+    som_learning_rate: float = Field(
+        default=0.01,
+        gt=0,
+        le=1,
+        allow_inf_nan=False,
+        description="Initial SOM learning rate.",
+    )
+    som_sigma: float = Field(
+        default=0.5,
+        gt=0,
+        allow_inf_nan=False,
+        description="Initial SOM neighborhood radius.",
+    )
+    som_source_layer: NonNegativeInt | None = Field(
+        default=None,
+        description=(
+            "Zero-based source layer for global SOM; unset to search middle-to-late "
+            "layers. In auto, only the global choice is fixed."
+        ),
+    )
+    som_max_weight: float = Field(
+        default=4.0,
+        gt=0.8,
+        allow_inf_nan=False,
+        description="Upper bound for SOM total ablation strength across all directions.",
+    )
+
+    @model_validator(mode="after")
+    def validate_som(self) -> "Settings":
+        if self.modifier == "som":
+            x, y = self.som_grid_shape or (self.som_grid_size, self.som_grid_size)
+            if self.som_directions > x * y:
+                raise ValueError(
+                    "som_directions cannot exceed the SOM grid's neuron count"
+                )
+            if (
+                self.som_direction_scope == "per layer"
+                and self.som_source_layer is not None
+            ):
+                raise ValueError("som_source_layer is only used by global or auto SOM")
+        return self
+
+    @classmethod
+    def from_saved(cls, data: dict[str, Any]) -> "Settings":
+        """Restore older settings without inheriting new modifier options."""
+        data = dict(data)
+        # Version-3 settings predate modifiers and always use abliteration.
+        # Supply missing historical defaults before merging other config sources.
+        data.setdefault("modifier", "abliteration")
+        if data["modifier"] == "som":
+            data.setdefault("som_direction_scope", "global")
+            data.setdefault("som_grid_shape", None)
+        return cls.model_validate(data)
 
     orthogonalize_direction: bool = Field(
         default=True,

@@ -3,6 +3,7 @@
 
 # ruff: noqa: E402
 
+import json
 import sys
 
 # Ensure standard output/error use UTF-8 instead of system default charmap (e.g. cp1252 on Windows).
@@ -42,7 +43,6 @@ import random
 import re
 import time
 import warnings
-from dataclasses import asdict
 from importlib.metadata import version
 from os.path import commonprefix
 from pathlib import Path
@@ -54,7 +54,6 @@ import numpy as np
 import optuna
 import questionary
 import torch
-import torch.nn.functional as F
 import transformers
 from huggingface_hub import HfApi, ModelCard, ModelCardData
 from lm_eval.models.huggingface import HFLM
@@ -71,10 +70,10 @@ from rich.table import Table
 from rich.text import Text
 from rich.traceback import install
 
-from .analyzer import Analyzer
 from .config import ExportStrategy, QuantizationMethod
 from .evaluator import Evaluator
-from .model import AbliterationParameters, Model, get_model_class
+from .model import Model, get_model_class
+from .modifier import create_modifier
 from .reproduce import (
     check_environment,
     collect_reproducibles,
@@ -224,8 +223,11 @@ def run():
         print(f"[red]Configuration contains [bold]{error.error_count()}[/] errors:[/]")
 
         for error_details in error.errors():
+            location = (
+                ".".join(str(part) for part in error_details["loc"]) or "settings"
+            )
             print(
-                f"[bold]{error_details['loc'][0]}[/]: [yellow]{error_details['msg']}[/]"
+                f"[bold]{escape(location)}[/]: [yellow]{escape(error_details['msg'])}[/]"
             )
 
         print()
@@ -245,15 +247,16 @@ def run():
         # FIXME: "Reproduction"/"reproducibility" name inconsistency!
         reproduction_information = load_reproduction_information(settings.reproduce)
 
-        # Version 3 is the plugin-era schema, which stores generic scorer
-        # `scores`/`baseline_scores`. It is intentionally NOT compatible with the
+        # Version 4 adds the internal modifier's name and parameter payload.
+        # Version 3 stores the original ablation parameters and generic scorer
+        # scores. Both are intentionally NOT compatible with the
         # pre-plugin v1/v2 schema (hardcoded refusals/KL `metrics`), so those are
         # rejected rather than silently failing on a missing key later.
-        if reproduction_information["version"] != "3":
+        if reproduction_information["version"] not in ("3", "4"):
             print(
                 (
                     f"[red]Unsupported file format version: [bold]{reproduction_information['version']}[/].[/] "
-                    "This version of Heretic reads version 3 (plugin scorer) reproduce.json files. "
+                    "This fork reads version 3 (scorers) and version 4 (internal modifiers) reproduce.json files. "
                     "Older files were produced before the scorer-plugin refactor and are not supported. "
                     "Please install Heretic 1.4 to use these files."
                 )
@@ -265,7 +268,7 @@ def run():
 
         print()
 
-        settings = Settings.model_validate(reproduction_information["settings"])
+        settings = Settings.from_saved(reproduction_information["settings"])
 
     if settings.seed is None:
         settings.seed = random.randint(0, 2**32 - 1)
@@ -316,6 +319,7 @@ def run():
         "".join(
             [(c if (c.isalnum() or c in ["_", "-"]) else "--") for c in settings.model]
         )
+        + ("" if settings.modifier == "abliteration" else f"--{settings.modifier}")
         + ".jsonl",
     )
 
@@ -402,8 +406,8 @@ def run():
             return
 
         if action == "continue":
-            settings = Settings.model_validate_json(
-                existing_study.user_attrs["settings"]
+            settings = Settings.from_saved(
+                json.loads(existing_study.user_attrs["settings"])
             )
         elif action == "restart":
             os.unlink(study_checkpoint_file)
@@ -584,53 +588,9 @@ def run():
         return
 
     print()
-    print("Calculating per-layer residual directions...")
-
-    needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
-
-    if needs_full_residuals:
-        print("* Obtaining residuals for good prompts...")
-        good_residuals = model.get_residuals_batched(good_prompts)
-        print("* Obtaining residuals for bad prompts...")
-        bad_residuals = model.get_residuals_batched(bad_prompts)
-
-        good_means = good_residuals.mean(dim=0)
-        bad_means = bad_residuals.mean(dim=0)
-
-        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
-
-        if settings.print_residual_geometry:
-            analyzer.print_residual_geometry()
-
-        if settings.plot_residuals:
-            analyzer.plot_residuals()
-
-        # We don't need the full residuals after computing their means and analyzing geometry.
-        del good_residuals, bad_residuals, analyzer
-    else:
-        print("* Obtaining residual mean for good prompts...")
-        good_means = model.get_residuals_mean(good_prompts)
-        print("* Obtaining residual mean for bad prompts...")
-        bad_means = model.get_residuals_mean(bad_prompts)
-
-    residual_directions = F.normalize(bad_means - good_means, p=2, dim=1)
-
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the residual directions so that only the component that is
-        # orthogonal to the good direction is subtracted during abliteration.
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(residual_directions * good_directions, dim=1)
-        residual_directions = (
-            residual_directions - projection_vector.unsqueeze(1) * good_directions
-        )
-        residual_directions = F.normalize(residual_directions, p=2, dim=1)
-        del good_directions, projection_vector
-
-    del good_means, bad_means
-
-    # Clear cache before starting the optimization study.
-    # This should free up memory from the objects released with the del statements above.
+    modifier = create_modifier(settings, model)
+    print(f"Initializing modifier [bold]{settings.modifier}[/]...")
+    modifier.init(good_prompts, bad_prompts)
     empty_cache()
 
     trial_index = 0
@@ -642,83 +602,9 @@ def run():
         trial_index += 1
         trial.set_user_attr("index", trial_index)
 
-        direction_scope = trial.suggest_categorical(
-            "direction_scope",
-            [
-                "global",
-                "per layer",
-            ],
-        )
-
-        last_layer_index = len(model.get_layers()) - 1
-
-        # Discrimination between "harmful" and "harmless" inputs is usually strongest
-        # in layers slightly past the midpoint of the layer stack. See the original
-        # abliteration paper (https://arxiv.org/abs/2406.11717) for a deeper analysis.
-        #
-        # Note that we always sample this parameter even though we only need it for
-        # the "global" direction scope. The reason is that multivariate TPE doesn't
-        # work with conditional or variable-range parameters.
-        direction_index = trial.suggest_float(
-            "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
-        )
-
-        if direction_scope == "per layer":
-            direction_index = None
-
-        parameters = {}
-
-        for component in model.get_abliterable_components():
-            # The parameter ranges are based on experiments with various models
-            # and much wider ranges. They are not set in stone and might have to be
-            # adjusted for future models.
-            #
-            # The MLP gets a negative lower bound that is then clamped to 0, so the
-            # optimizer can fully disable its ablation. The clamp puts a positive
-            # probability mass on exactly 0 (the continuous sampler would otherwise
-            # reach 0 with probability zero). Ablating the MLP is often unnecessary for
-            # removing refusals and tends to damage model intelligence more than
-            # ablating the attention output, so on many models the optimum is to leave
-            # it (mostly) untouched. See issue #202.
-            max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
-            max_weight = max(
-                0.0,
-                trial.suggest_float(
-                    f"{component}.max_weight",
-                    max_weight_lower_bound,
-                    1.5,
-                ),
-            )
-            max_weight_position = trial.suggest_float(
-                f"{component}.max_weight_position",
-                0.6 * last_layer_index,
-                1.0 * last_layer_index,
-            )
-            # For sampling purposes, min_weight is expressed as a fraction of max_weight,
-            # again because multivariate TPE doesn't support variable-range parameters.
-            # The value is transformed into the actual min_weight value below.
-            min_weight = trial.suggest_float(
-                f"{component}.min_weight",
-                0.0,
-                1.0,
-            )
-            min_weight_distance = trial.suggest_float(
-                f"{component}.min_weight_distance",
-                1.0,
-                max(0.6 * last_layer_index, 1.0),
-            )
-
-            parameters[component] = AbliterationParameters(
-                max_weight=max_weight,
-                max_weight_position=max_weight_position,
-                min_weight=(min_weight * max_weight),
-                min_weight_distance=min_weight_distance,
-            )
-
-        trial.set_user_attr("direction_index", direction_index)
-        trial.set_user_attr("parameters", {k: asdict(v) for k, v in parameters.items()})
+        parameters = modifier.suggest_parameters(trial)
+        trial.set_user_attr("modifier", settings.modifier)
+        trial.set_user_attr("modifier_parameters", parameters)
 
         print()
         print(
@@ -728,9 +614,9 @@ def run():
         for name, value in get_trial_parameters(trial).items():
             print(f"  * {name} = [bold]{value}[/]")
         print("* Resetting model...")
-        model.reset_model()
-        print("* Abliterating...")
-        model.abliterate(residual_directions, direction_index, parameters)
+        modifier.reset_model()
+        print(f"* Applying {settings.modifier}...")
+        modifier.modify_model(parameters)
         print("* Evaluating...")
         scores = evaluator.get_scores()
         objective_values = evaluator.get_objective_values(scores)
@@ -886,14 +772,18 @@ def run():
             if reproduction_mode:
                 parameters = reproduction_information["parameters"]
 
-                trial = create_trial(
-                    values=[],
-                    user_attrs={
+                if reproduction_information["version"] == "3":
+                    attributes = {
                         "direction_index": parameters["direction_index"],
                         "parameters": parameters["abliteration_parameters"],
-                        "scores": reproduction_information["scores"],
-                    },
-                )
+                    }
+                else:
+                    attributes = {
+                        "modifier": parameters["modifier"],
+                        "modifier_parameters": parameters["parameters"],
+                    }
+                attributes["scores"] = reproduction_information["scores"]
+                trial = create_trial(values=[], user_attrs=attributes)
 
                 print()
                 print("Restoring model from reproduction information...")
@@ -968,16 +858,9 @@ def run():
             # to restore the previous LoRA-ified state.
             def reset_trial_model():
                 print("* Resetting model...")
-                model.reset_model()
-                print("* Abliterating...")
-                model.abliterate(
-                    residual_directions,
-                    trial.user_attrs["direction_index"],
-                    {
-                        k: AbliterationParameters(**v)
-                        for k, v in trial.user_attrs["parameters"].items()
-                    },
-                )
+                modifier.reset_model()
+                print(f"* Applying {settings.modifier}...")
+                modifier.modify_model(modifier.parameters_from_trial(trial))
 
             reset_trial_model()
 
